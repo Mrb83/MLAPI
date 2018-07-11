@@ -929,8 +929,13 @@ namespace MLAPI.MonoBehaviours.Core
         #region NetworkedVar
 
         private bool networkedVarInit = false;
-        private readonly List<HashSet<int>> channelMappedVarIndexes = new List<HashSet<int>>();
-        private readonly List<string> channelsForVarGroups = new List<string>();
+        List<ChannelVarGroup> channelVarGroups = new List<ChannelVarGroup>();
+        private class ChannelVarGroup
+        {
+            public string channel;
+            public List<int> vars;
+        }
+
         internal readonly List<INetworkedVar> networkedVarFields = new List<INetworkedVar>();
         private static readonly Dictionary<Type, FieldInfo[]> fieldTypes = new Dictionary<Type, FieldInfo[]>();
 
@@ -963,24 +968,27 @@ namespace MLAPI.MonoBehaviours.Core
                     
                     instance.SetNetworkedBehaviour(this);
                     networkedVarFields.Add(instance);
+
+                    if (networkedVarFields.Count > (int)Int16.MaxValue)
+                        throw new Exception("Cannot have more than 2^16 NetworkedVar fields per NetworkedMonoBehaviour");
                 }
             }
 
-            //Create index map for channels
-            Dictionary<string, int> firstLevelIndex = new Dictionary<string, int>();
-            int secondLevelCounter = 0;
-            for (int i = 0; i < networkedVarFields.Count; i++)
+            Dictionary<string, ChannelVarGroup> channelToVarGroup = new Dictionary<string, ChannelVarGroup>();
+            for (int i = 0; i < networkedVarFields.Count; ++i)
             {
-                string channel = networkedVarFields[i].GetChannel(); //Cache this here. Some developers are stupid. You don't know what shit they will do in their methods
-                if (!firstLevelIndex.ContainsKey(channel))
+                string channel = networkedVarFields[i].GetChannel(); //Cache this here. You never know what operations users will do in their methods.
+                ChannelVarGroup group;
+                if (!channelToVarGroup.ContainsKey(channel))
                 {
-                    firstLevelIndex.Add(channel, secondLevelCounter);
-                    channelsForVarGroups.Add(channel);
-                    secondLevelCounter++;
+                    group = new ChannelVarGroup { channel = channel, vars = new List<int>() };
+                    channelToVarGroup.Add(channel, group);
+                    channelVarGroups.Add(group);
                 }
-                if (firstLevelIndex[channel] >= channelMappedVarIndexes.Count)
-                    channelMappedVarIndexes.Add(new HashSet<int>());
-                channelMappedVarIndexes[firstLevelIndex[channel]].Add(i);
+                else
+                    group = channelToVarGroup[channel];
+
+                group.vars.Add(i);
             }
         }
 
@@ -993,35 +1001,40 @@ namespace MLAPI.MonoBehaviours.Core
             for (int i = 0; i < NetworkingManager.singleton.ConnectedClientsList.Count; i++)
             {
                 //This iterates over every "channel group".
-                for (int j = 0; j < channelMappedVarIndexes.Count; j++)
+                for (int j = 0; j < channelVarGroups.Count; j++)
                 {
-                    using (BitWriter writer = BitWriter.Get())
+                    ChannelVarGroup group = channelVarGroups[j];
+                    using (BitWriter varWriter = BitWriter.Get())
                     {
-                        writer.WriteUInt(networkId);
-                        writer.WriteUShort(networkedObject.GetOrderIndex(this));
-
                         uint clientId = NetworkingManager.singleton.ConnectedClientsList[i].ClientId;
-                        for (int k = 0; k < networkedVarFields.Count; k++)
+                        int writtenCount = 0;
+                        for (int k = 0; k < group.vars.Count; k++)
                         {
-                            if (!channelMappedVarIndexes[j].Contains(k))
+                            int index = group.vars[k];
+                            INetworkedVar netvar = networkedVarFields[index];
+                            if (netvar.IsDirty() && (!isServer || netvar.CanClientRead(clientId)))
                             {
-                                //This var does not belong to the currently iterating channel group.
-                                writer.WriteBool(false);
-                                continue;
-                            }
-
-                            bool isDirty = networkedVarFields[k].IsDirty(); //cache this here. You never know what operations users will do in the dirty methods
-                            writer.WriteBool(isDirty);
-                            if (isDirty && (!isServer || networkedVarFields[k].CanClientRead(clientId)))
-                            {
-                                networkedVarFields[k].WriteDelta(writer);
+                                varWriter.WriteUShort((ushort)index);
+                                netvar.WriteDelta(varWriter);
+                                writtenCount++;
                             }
                         }
 
-                        if (isServer)
-                            InternalMessageHandler.Send(clientId, "MLAPI_NETWORKED_VAR_DELTA", channelsForVarGroups[j], writer, null);
-                        else
-                            InternalMessageHandler.Send(NetworkingManager.singleton.NetworkConfig.NetworkTransport.ServerNetId, "MLAPI_NETWORKED_VAR_DELTA", channelsForVarGroups[j], writer, null);
+                        if (writtenCount > 0)
+                        {
+                            using (BitWriter writer = BitWriter.Get())
+                            {
+                                writer.WriteUInt(networkId);
+                                writer.WriteUShort(networkedObject.GetOrderIndex(this));
+                                writer.WriteUShort((ushort)writtenCount);
+                                writer.WriteWriter(varWriter);
+
+                            if (isServer)
+                                    InternalMessageHandler.Send(clientId, "MLAPI_NETWORKED_VAR_DELTA", group.channel, writer, null);
+                                else
+                                    InternalMessageHandler.Send(NetworkingManager.singleton.NetworkConfig.NetworkTransport.ServerNetId, "MLAPI_NETWORKED_VAR_DELTA", group.channel, writer, null);
+                            }
+                        }
                     }
                 }
             }
@@ -1034,12 +1047,17 @@ namespace MLAPI.MonoBehaviours.Core
 
         internal void HandleNetworkedVarDeltas(BitReader reader, uint clientId)
         {
-            for (int i = 0; i < networkedVarFields.Count; i++)
+            int deltaCount = (int)reader.ReadUShort();
+            for (int i = 0; i < deltaCount; i++)
             {
-                if (!reader.ReadBool())
-                    continue;
+                int index = reader.ReadUShort();
+                if (index >= networkedVarFields.Count)
+                {
+                    if (LogHelper.CurrentLogLevel <= LogLevel.Error) LogHelper.LogError("Received an index for NetworkedVar that is out of range");
+                    return;
+                }
 
-                if (isServer && !networkedVarFields[i].CanClientWrite(clientId))
+                if (isServer && !networkedVarFields[index].CanClientWrite(clientId))
                 {
                     //This client wrote somewhere they are not allowed. This is critical
                     //We can't just skip this field. Because we don't actually know how to dummy read
@@ -1052,18 +1070,22 @@ namespace MLAPI.MonoBehaviours.Core
                     return;
                 }
 
-                networkedVarFields[i].ReadDelta(reader);
+                networkedVarFields[index].ReadDelta(reader);
             }
         }
 
         internal void HandleNetworkedVarUpdate(BitReader reader, uint clientId)
         {
-            for (int i = 0; i < networkedVarFields.Count; i++)
+            int updateCount = (int)reader.ReadUShort();
+            for (int i = 0; i < updateCount; i++)
             {
-                if (!reader.ReadBool())
-                    continue;
-
-                if (isServer && !networkedVarFields[i].CanClientWrite(clientId))
+                int index = reader.ReadUShort();
+                if (index >= networkedVarFields.Count)
+                {
+                    if (LogHelper.CurrentLogLevel <= LogLevel.Error) LogHelper.LogError("Received an index for NetworkedVar that is out of range");
+                    return;
+                }
+                if (isServer && !networkedVarFields[index].CanClientWrite(clientId))
                 {
                     //This client wrote somewhere they are not allowed. This is critical
                     //We can't just skip this field. Because we don't actually know how to dummy read
@@ -1076,7 +1098,7 @@ namespace MLAPI.MonoBehaviours.Core
                     return;
                 }
 
-                networkedVarFields[i].ReadField(reader);
+                networkedVarFields[index].ReadField(reader);
             }
         }
 
